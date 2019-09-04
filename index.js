@@ -1,5 +1,6 @@
 const openpgp = require('openpgp');
 const express = require('express');
+var bodyParser = require('body-parser')
 const express_session = require('express-session');
 const express_handlebars = require('express-handlebars');
 const fetch = require('node-fetch');
@@ -10,6 +11,11 @@ const uuid = require('uuid/v5');
 const fs = require('fs');
 const cluster = require('cluster');
 const util = require('util');
+var sqlite3 = require('sqlite3').verbose();
+var db = new sqlite3.Database(':memory:');
+db.run('CREATE TABLE messages (user text, message text, sent bool);');
+
+
 
 const init = async () => {
 	console.log('Starting server');
@@ -25,7 +31,14 @@ const server = async () => {
 	app.use(express.urlencoded({ limit: '16mb', extended: true }));
 	app.use(express.json({ limit: '16mb', extended: true }));
 	app.use(express_session({ secret: 'd8ca01bd-d585-4dd8-8a16-a7195d7fc2a8', name: 'Hackathon', proxy: true, resave: true, saveUninitialized: true }));
-
+	app.use(bodyParser.json())
+	app.post('/', (req, res) => {
+		db.run(`INSERT INTO messages values (?,?,?);`, [req.body.user, req.body.message, false]);
+		db.all(`select user, message from messages where sent = False;`, (err, rows) => {
+			console.log(rows);
+		})
+		res.send();
+	})
 	openpgp.initWorker({ path: 'openpgp.worker.js' });
 
 	let key = {}, identity = {};
@@ -174,23 +187,34 @@ const server = async () => {
 				ws.send(update);
 			});
 
+			sendmessage = async (user, message) => {
+				let socket = Socket.getWss('/socket/');
+				let signature = await service.sign(message, key[uuid], identity[uuid]) || "Message has no signature";
+				let update = JSON.stringify( {
+					"from": user,
+					"uuid": uuid,
+					"time": service.time(),
+					"message": message,
+					"signature": signature
+				} );
+				socket.clients.forEach(function (client) {
+					client.send(update);
+				});
+			};
+
 			ws.on('message', async function (message) {
 				try {
 					if (service.is.json(message)) {
 						let event = JSON.parse(message);
 						if (event.hasOwnProperty("message")) {
-							let socket = Socket.getWss('/socket/');
-							let signature = await service.sign(event.message.message, key[uuid], identity[uuid]) || "Message has no signature";
-							let update = JSON.stringify( {
-								"from": event.message.username,
-								"uuid": uuid,
-								"time": service.time(),
-								"message": event.message.message,
-								"signature": signature
-							} );
-							socket.clients.forEach(function (client) {
-								client.send(update);
-							});
+							if (event.message.message == "poll") {
+								db.each(`select user, message from messages where sent = False`, (err, result) => {
+									sendmessage(result.user, result.message);
+								});
+								db.run(`update messages set sent = True where sent = False`);
+							} else {
+								sendmessage(event.message.username, event.message.message)							
+							}
 						};
 
 						if (event.hasOwnProperty("pgp")) {
